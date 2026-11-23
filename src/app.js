@@ -6,6 +6,7 @@ const morgan = require("morgan");
 const errorHandler = require("./middleware/errorHandler");
 const healthRouter = require("./routes/health.routes");
 const authRouter = require("./routes/auth.routes");
+const userRouter = require("./routes/user.routes");
 const ApiError = require("./utils/apiError");
 
 const app = express();
@@ -46,6 +47,7 @@ app.use(cookieParser());
 // Base API v1 Routes
 app.use("/api/v1", healthRouter);
 app.use("/api/v1/auth", authRouter);
+app.use("/api/v1/users", userRouter);
 
 // Root route
 app.get("/", (req, res) => {
