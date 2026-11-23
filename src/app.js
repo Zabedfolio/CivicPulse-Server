@@ -7,6 +7,7 @@ const errorHandler = require("./middleware/errorHandler");
 const healthRouter = require("./routes/health.routes");
 const authRouter = require("./routes/auth.routes");
 const userRouter = require("./routes/user.routes");
+const issueRouter = require("./routes/issue.routes");
 const ApiError = require("./utils/apiError");
 
 const app = express();
@@ -48,6 +49,7 @@ app.use(cookieParser());
 app.use("/api/v1", healthRouter);
 app.use("/api/v1/auth", authRouter);
 app.use("/api/v1/users", userRouter);
+app.use("/api/v1/issues", issueRouter);
 
 // Root route
 app.get("/", (req, res) => {
