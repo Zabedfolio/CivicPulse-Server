@@ -45,3 +45,17 @@ test("GET /api/v1/issues returns 200 with standard response envelope", async () 
   const json = await res.json();
   assert.ok("success" in json);
 });
+
+test("GET /api/v1/issues/mine without token returns 401 Unauthorized", async () => {
+  const res = await fetch(`${baseUrl}/api/v1/issues/mine`);
+  assert.strictEqual(res.status, 401);
+  const json = await res.json();
+  assert.strictEqual(json.success, false);
+  assert.match(json.message, /Authentication required/);
+});
+
+test("GET /api/v1/issues/:id/history with invalid id returns 404 or error", async () => {
+  const res = await fetch(`${baseUrl}/api/v1/issues/000000000000000000000000/history`);
+  assert.ok(res.status === 404 || res.status === 500);
+});
+

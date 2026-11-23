@@ -190,6 +190,53 @@ router.get(
 );
 
 /**
+ * GET /api/v1/issues/mine
+ * List issues reported by the currently authenticated user
+ */
+router.get(
+  "/mine",
+  protect,
+  asyncHandler(async (req, res) => {
+    const { status, category, priority, page = 1, limit = 20 } = req.query;
+    const filter = { reporter: req.user._id };
+
+    if (status && status !== "all") filter.status = status;
+    if (category && category !== "all") filter.category = category;
+    if (priority) filter.priority = priority;
+
+    const pageNum = Math.max(1, parseInt(page, 10));
+    const limitNum = Math.max(1, Math.min(100, parseInt(limit, 10)));
+    const skip = (pageNum - 1) * limitNum;
+
+    const [issues, total] = await Promise.all([
+      Issue.find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limitNum)
+        .populate("reporter", "name email image role")
+        .populate("department", "name code")
+        .populate("assignedTo", "name email")
+        .lean(),
+      Issue.countDocuments(filter),
+    ]);
+
+    const pagination = {
+      total,
+      page: pageNum,
+      limit: limitNum,
+      totalPages: Math.ceil(total / limitNum) || 1,
+    };
+
+    return new ApiResponse(
+      200,
+      { issues },
+      "Citizen issues retrieved successfully",
+      pagination
+    ).send(res);
+  })
+);
+
+/**
  * GET /api/v1/issues/:id
  * Retrieve issue details along with status transition history
  */
@@ -216,6 +263,31 @@ router.get(
       200,
       { issue, history },
       "Issue details retrieved successfully"
+    ).send(res);
+  })
+);
+
+/**
+ * GET /api/v1/issues/:id/history
+ * Retrieve chronological status transitions for a specific issue
+ */
+router.get(
+  "/:id/history",
+  asyncHandler(async (req, res) => {
+    const issue = await Issue.findById(req.params.id).select("_id title status").lean();
+    if (!issue) {
+      throw new ApiError(404, "Issue not found");
+    }
+
+    const history = await IssueStatusHistory.find({ issue: req.params.id })
+      .sort({ createdAt: 1 })
+      .populate("changedBy", "name role image")
+      .lean();
+
+    return new ApiResponse(
+      200,
+      { issueId: issue._id, history },
+      "Issue history retrieved successfully"
     ).send(res);
   })
 );
