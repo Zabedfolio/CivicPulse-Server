@@ -4,7 +4,7 @@ const Issue = require("../models/Issue");
 const Department = require("../models/Department");
 const IssueStatusHistory = require("../models/IssueStatusHistory");
 const ActivityLog = require("../models/ActivityLog");
-const { protect } = require("../middleware/auth");
+const { protect, optionalAuth } = require("../middleware/auth");
 const upload = require("../middleware/upload");
 const { uploadToCloudinary } = require("../config/cloudinary");
 const ApiResponse = require("../utils/apiResponse");
@@ -148,30 +148,91 @@ router.post(
 
 /**
  * GET /api/v1/issues
- * List issues with optional category, status, and reporter filters
+ * List issues with role-scoping, search query, multi-criteria filtering, dynamic sorting, and pagination
  */
 router.get(
   "/",
+  optionalAuth,
   asyncHandler(async (req, res) => {
-    const { status, category, reporter, priority, page = 1, limit = 20 } = req.query;
+    const {
+      status,
+      category,
+      priority,
+      department,
+      reporter,
+      search,
+      q,
+      startDate,
+      endDate,
+      sortBy = "createdAt",
+      sortOrder = "desc",
+      page = 1,
+      limit = 20,
+    } = req.query;
+
     const filter = {};
 
-    if (status) filter.status = status;
-    if (category) filter.category = category;
-    if (priority) filter.priority = priority;
+    // 1. Role-based scoping:
+    // If authenticated user is a 'manager', strictly restrict query to their department
+    if (req.user && req.user.role === "manager") {
+      if (req.user.department) {
+        filter.department = req.user.department;
+      }
+    } else if (department && department !== "all") {
+      // Admins (or public) can filter by a specific department
+      filter.department = department;
+    }
+
+    // 2. Standard Filters
+    if (status && status !== "all") {
+      if (status.includes(",")) {
+        filter.status = { $in: status.split(",").map((s) => s.trim()) };
+      } else {
+        filter.status = status;
+      }
+    }
+    if (category && category !== "all") filter.category = category;
+    if (priority && priority !== "all") filter.priority = priority;
     if (reporter) filter.reporter = reporter;
 
-    const pageNum = Math.max(1, parseInt(page, 10));
-    const limitNum = Math.max(1, Math.min(100, parseInt(limit, 10)));
+    // 3. Search query: case-insensitive match on title and address
+    const searchQuery = (search || q || "").trim();
+    if (searchQuery) {
+      // Sanitize regex special characters
+      const escapedQuery = searchQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      filter.$or = [
+        { title: { $regex: escapedQuery, $options: "i" } },
+        { address: { $regex: escapedQuery, $options: "i" } },
+      ];
+    }
+
+    // 4. Date range filter
+    if (startDate || endDate) {
+      filter.createdAt = {};
+      if (startDate) filter.createdAt.$gte = new Date(startDate);
+      if (endDate) filter.createdAt.$lte = new Date(endDate);
+    }
+
+    // 5. Pagination & Sorting
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.max(1, Math.min(100, parseInt(limit, 10) || 20));
     const skip = (pageNum - 1) * limitNum;
+
+    // Validate and sanitize sort field and order
+    const allowedSortFields = ["createdAt", "updatedAt", "priority", "status", "title", "category"];
+    const sortField = allowedSortFields.includes(sortBy) ? sortBy : "createdAt";
+    const sortDirection = sortOrder === "asc" || sortOrder === "1" ? 1 : -1;
+    const sortObj = { [sortField]: sortDirection };
 
     const [issues, total] = await Promise.all([
       Issue.find(filter)
-        .sort({ createdAt: -1 })
+        .sort(sortObj)
         .skip(skip)
         .limit(limitNum)
         .populate("reporter", "name email image role")
         .populate("department", "name code")
+        .populate("assignedTo", "name email image")
+        .populate("verifiedBy", "name email role")
         .lean(),
       Issue.countDocuments(filter),
     ]);

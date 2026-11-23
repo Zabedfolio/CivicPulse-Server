@@ -60,4 +60,55 @@ const protect = asyncHandler(async (req, res, next) => {
   next();
 });
 
-module.exports = { protect };
+/**
+ * Optional Auth middleware:
+ * Populates req.user if a valid Better Auth session token or cookie is supplied,
+ * but allows the request to proceed if unauthenticated.
+ */
+const optionalAuth = asyncHandler(async (req, res, next) => {
+  let token;
+
+  if (req.cookies && req.cookies["better-auth.session_token"]) {
+    token = req.cookies["better-auth.session_token"];
+  } else if (
+    req.headers.authorization &&
+    req.headers.authorization.startsWith("Bearer ")
+  ) {
+    token = req.headers.authorization.split(" ")[1];
+  }
+
+  if (!token) {
+    return next();
+  }
+
+  try {
+    const db = mongoose.connection.db;
+    if (!db) return next();
+
+    const session = await db.collection("session").findOne({
+      token: token,
+      expiresAt: { $gt: new Date() },
+    });
+
+    if (!session) return next();
+
+    let user = null;
+    if (mongoose.Types.ObjectId.isValid(session.userId)) {
+      user = await User.findById(session.userId);
+    }
+    if (!user) {
+      user = await User.findOne({ _id: session.userId });
+    }
+
+    if (user && user.isActive) {
+      req.user = user;
+      req.session = session;
+    }
+  } catch (err) {
+    // Continue without user if session lookup fails
+  }
+
+  next();
+});
+
+module.exports = { protect, optionalAuth };

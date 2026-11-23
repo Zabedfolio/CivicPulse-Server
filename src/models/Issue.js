@@ -136,6 +136,10 @@ const IssueSchema = new mongoose.Schema(
 // 2dsphere index for geospatial proximity queries
 IssueSchema.index({ location: "2dsphere" });
 
+// Compound index for role-scoped management queries (department, status, creation timestamp)
+IssueSchema.index({ department: 1, status: 1, createdAt: -1 });
+IssueSchema.index({ category: 1, priority: 1, createdAt: -1 });
+
 module.exports = mongoose.model("Issue", IssueSchema);
 module.exports.ISSUE_CATEGORIES = ISSUE_CATEGORIES;
 module.exports.ISSUE_PRIORITIES = ISSUE_PRIORITIES;
