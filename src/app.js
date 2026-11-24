@@ -10,6 +10,7 @@ const userRouter = require("./routes/user.routes");
 const issueRouter = require("./routes/issue.routes");
 const departmentRouter = require("./routes/department.routes");
 const notificationRouter = require("./routes/notification.routes");
+const taskRouter = require("./routes/task.routes");
 const ApiError = require("./utils/apiError");
 
 const app = express();
@@ -54,6 +55,7 @@ app.use("/api/v1/users", userRouter);
 app.use("/api/v1/issues", issueRouter);
 app.use("/api/v1/departments", departmentRouter);
 app.use("/api/v1/notifications", notificationRouter);
+app.use("/api/v1/tasks", taskRouter);
 
 // Root route
 app.get("/", (req, res) => {
