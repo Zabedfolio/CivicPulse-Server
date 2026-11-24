@@ -10,6 +10,8 @@ const Notification = require("../models/Notification");
 const { protect } = require("../middleware/auth");
 const { authorize } = require("../middleware/roleCheck");
 const { transitionIssueStatus } = require("../services/issueWorkflow");
+const upload = require("../middleware/upload");
+const { uploadToCloudinary } = require("../config/cloudinary");
 const ApiResponse = require("../utils/apiResponse");
 const ApiError = require("../utils/apiError");
 const asyncHandler = require("../utils/asyncHandler");
@@ -419,6 +421,225 @@ router.get(
     }
 
     return new ApiResponse(200, { task }, "Task details retrieved successfully").send(res);
+  })
+);
+
+/**
+ * PATCH /api/v1/tasks/:id/status
+ * Transition task status: Pending -> In Progress, In Progress -> Completed
+ * Synchronously transitions linked Issue and notifies citizen
+ */
+router.patch(
+  "/:id/status",
+  authorize("staff", "manager", "admin"),
+  asyncHandler(async (req, res) => {
+    const { status, note } = req.body;
+
+    if (!status || !Task.TASK_STATUSES.includes(status)) {
+      throw new ApiError(
+        400,
+        `Status is required and must be one of: ${Task.TASK_STATUSES.join(", ")}`
+      );
+    }
+
+    const task = await Task.findById(req.params.id);
+    if (!task) {
+      throw new ApiError(404, "Task not found.");
+    }
+
+    // Staff ownership guard
+    if (req.user.role === "staff") {
+      if (!task.assignedTo || !task.assignedTo.equals(req.user._id)) {
+        throw new ApiError(403, "Forbidden: You can only update tasks assigned to you.");
+      }
+    } else if (req.user.role === "manager") {
+      if (
+        req.user.department &&
+        task.department &&
+        !task.department.equals(req.user.department)
+      ) {
+        throw new ApiError(403, "Forbidden: You can only update tasks in your department.");
+      }
+    }
+
+    // Strict validation: completing a task requires at least 1 photo proof!
+    if (status === "Completed") {
+      if (!task.completionPhotos || task.completionPhotos.length === 0) {
+        throw new ApiError(
+          400,
+          "At least one photographic proof of repair is required to mark this task as completed."
+        );
+      }
+      task.completedAt = new Date();
+    }
+
+    const previousStatus = task.status;
+    task.status = status;
+    await task.save();
+
+    // Synchronously transition linked Issue status
+    const issue = await Issue.findById(task.issue);
+    if (issue) {
+      if (status === "In Progress" && issue.status !== "In Progress") {
+        try {
+          await transitionIssueStatus(issue._id, "In Progress", req.user, {
+            note: note?.trim() || "Field crew started work on-site",
+          });
+        } catch (err) {
+          issue.status = "In Progress";
+          await issue.save();
+        }
+      } else if (status === "Completed" && issue.status !== "Resolved") {
+        try {
+          await transitionIssueStatus(issue._id, "Resolved", req.user, {
+            note: note?.trim() || "Field repair completed with photographic proof",
+            metadata: { completionPhotos: task.completionPhotos },
+          });
+        } catch (err) {
+          issue.status = "Resolved";
+          issue.resolvedAt = new Date();
+          await issue.save();
+        }
+      }
+    }
+
+    // Activity log
+    await ActivityLog.create({
+      user: req.user._id,
+      action: "TASK_STATUS_UPDATED",
+      entityType: "Task",
+      entityId: task._id,
+      details: {
+        previousStatus,
+        newStatus: status,
+        note: note || "",
+      },
+    });
+
+    const populatedTask = await Task.findById(task._id)
+      .populate("issue", "title category address priority status image location reporter")
+      .populate("assignedTo", "name email image role phone")
+      .populate("department", "name code")
+      .lean();
+
+    return new ApiResponse(
+      200,
+      { task: populatedTask },
+      `Task status updated to '${status}' successfully`
+    ).send(res);
+  })
+);
+
+/**
+ * POST /api/v1/tasks/:id/progress
+ * Append an on-site field progress note to the task
+ */
+router.post(
+  "/:id/progress",
+  authorize("staff", "manager", "admin"),
+  asyncHandler(async (req, res) => {
+    const { note } = req.body;
+
+    if (!note || typeof note !== "string" || note.trim().length < 3) {
+      throw new ApiError(400, "Progress note must be at least 3 characters.");
+    }
+
+    const task = await Task.findById(req.params.id);
+    if (!task) {
+      throw new ApiError(404, "Task not found.");
+    }
+
+    if (req.user.role === "staff") {
+      if (!task.assignedTo || !task.assignedTo.equals(req.user._id)) {
+        throw new ApiError(403, "Forbidden: You can only log progress on your assigned tasks.");
+      }
+    }
+
+    const report = {
+      note: note.trim(),
+      by: req.user._id,
+      createdAt: new Date(),
+    };
+
+    task.progressReports.push(report);
+    await task.save();
+
+    // Log progress update in IssueStatusHistory for citizen transparency
+    await IssueStatusHistory.create({
+      issue: task.issue,
+      fromStatus: task.status,
+      toStatus: task.status,
+      changedBy: req.user._id,
+      note: `Field update: ${note.trim()}`,
+    });
+
+    return new ApiResponse(
+      200,
+      { progressReports: task.progressReports },
+      "Progress note recorded successfully"
+    ).send(res);
+  })
+);
+
+/**
+ * POST /api/v1/tasks/:id/completion-photos
+ * Upload photographic resolution proof to Cloudinary and append to task
+ */
+router.post(
+  "/:id/completion-photos",
+  authorize("staff", "manager", "admin"),
+  upload.single("image"),
+  asyncHandler(async (req, res) => {
+    if (!req.file) {
+      throw new ApiError(400, "An image file is required for completion proof.");
+    }
+
+    const task = await Task.findById(req.params.id);
+    if (!task) {
+      throw new ApiError(404, "Task not found.");
+    }
+
+    if (req.user.role === "staff") {
+      if (!task.assignedTo || !task.assignedTo.equals(req.user._id)) {
+        throw new ApiError(403, "Forbidden: You can only upload photos to your assigned tasks.");
+      }
+    }
+
+    // Upload to Cloudinary
+    let photoData;
+    try {
+      photoData = await uploadToCloudinary(
+        req.file.buffer,
+        "civicpulse/resolution_proofs"
+      );
+    } catch (uploadErr) {
+      throw new ApiError(500, `Cloudinary upload failed: ${uploadErr.message}`);
+    }
+
+    const photoEntry = {
+      url: photoData.url,
+      publicId: photoData.publicId,
+      uploadedAt: new Date(),
+    };
+
+    task.completionPhotos.push(photoEntry);
+
+    // If task was Pending, automatically move it to In Progress
+    if (task.status === "Pending") {
+      task.status = "In Progress";
+    }
+
+    await task.save();
+
+    return new ApiResponse(
+      200,
+      {
+        completionPhotos: task.completionPhotos,
+        latestPhoto: photoEntry,
+        taskStatus: task.status,
+      },
+      "Resolution proof photo uploaded successfully"
+    ).send(res);
   })
 );
 
