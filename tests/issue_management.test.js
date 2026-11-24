@@ -1,8 +1,23 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
+const app = require("../src/app");
+const http = require("http");
 
-const PORT = process.env.PORT || 5000;
-const baseUrl = `http://localhost:${PORT}`;
+let server;
+let baseUrl;
+
+test.before((t, done) => {
+  server = http.createServer(app);
+  server.listen(0, () => {
+    const port = server.address().port;
+    baseUrl = `http://127.0.0.1:${port}`;
+    done();
+  });
+});
+
+test.after((t, done) => {
+  server.close(done);
+});
 
 test("MGT-01: GET /api/v1/issues returns 200 with pagination structure", async () => {
   const res = await fetch(`${baseUrl}/api/v1/issues?page=1&limit=5`);

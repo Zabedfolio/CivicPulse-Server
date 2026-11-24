@@ -5,6 +5,7 @@ const Department = require("../models/Department");
 const IssueStatusHistory = require("../models/IssueStatusHistory");
 const ActivityLog = require("../models/ActivityLog");
 const { protect, optionalAuth } = require("../middleware/auth");
+const { authorize } = require("../middleware/roleCheck");
 const upload = require("../middleware/upload");
 const { uploadToCloudinary } = require("../config/cloudinary");
 const ApiResponse = require("../utils/apiResponse");
@@ -349,6 +350,234 @@ router.get(
       200,
       { issueId: issue._id, history },
       "Issue history retrieved successfully"
+    ).send(res);
+  })
+);
+
+/**
+ * PATCH /api/v1/issues/:id/verify
+ * Formally verify an issue report, setting verifiedBy and moving status to Under Review
+ */
+router.patch(
+  "/:id/verify",
+  protect,
+  authorize("manager", "admin"),
+  asyncHandler(async (req, res) => {
+    const issue = await Issue.findById(req.params.id);
+    if (!issue) {
+      throw new ApiError(404, "Issue not found");
+    }
+
+    // Role check: Department manager can only verify issues within their assigned department
+    if (req.user.role === "manager") {
+      if (
+        req.user.department &&
+        issue.department &&
+        !issue.department.equals(req.user.department)
+      ) {
+        throw new ApiError(
+          403,
+          "Forbidden: You can only manage and verify issues within your assigned department."
+        );
+      }
+    }
+
+    const previousStatus = issue.status;
+    issue.verifiedBy = req.user._id;
+
+    // Transition Submitted issues to Under Review
+    if (issue.status === "Submitted") {
+      issue.status = "Under Review";
+    }
+
+    // Optional priority update during verification
+    if (req.body.priority && Issue.ISSUE_PRIORITIES.includes(req.body.priority)) {
+      issue.priority = req.body.priority;
+    }
+
+    await issue.save();
+
+    const note = req.body.note?.trim() || "Issue inspected and verified by municipal manager";
+
+    // Write to audit logs
+    await IssueStatusHistory.create({
+      issue: issue._id,
+      fromStatus: previousStatus,
+      toStatus: issue.status,
+      changedBy: req.user._id,
+      note,
+    });
+
+    await ActivityLog.create({
+      user: req.user._id,
+      action: "ISSUE_VERIFIED",
+      entityType: "Issue",
+      entityId: issue._id,
+      details: {
+        previousStatus,
+        newStatus: issue.status,
+        priority: issue.priority,
+        note,
+      },
+    });
+
+    const populatedIssue = await Issue.findById(issue._id)
+      .populate("reporter", "name email image role")
+      .populate("department", "name code")
+      .populate("verifiedBy", "name email role")
+      .lean();
+
+    return new ApiResponse(
+      200,
+      { issue: populatedIssue },
+      "Issue verified successfully"
+    ).send(res);
+  })
+);
+
+/**
+ * PATCH /api/v1/issues/:id/priority
+ * Update severity priority of an issue
+ */
+router.patch(
+  "/:id/priority",
+  protect,
+  authorize("manager", "admin"),
+  asyncHandler(async (req, res) => {
+    const { priority, note } = req.body;
+
+    if (!priority || !Issue.ISSUE_PRIORITIES.includes(priority)) {
+      throw new ApiError(
+        400,
+        `Priority must be one of: ${Issue.ISSUE_PRIORITIES.join(", ")}`
+      );
+    }
+
+    const issue = await Issue.findById(req.params.id);
+    if (!issue) {
+      throw new ApiError(404, "Issue not found");
+    }
+
+    if (req.user.role === "manager") {
+      if (
+        req.user.department &&
+        issue.department &&
+        !issue.department.equals(req.user.department)
+      ) {
+        throw new ApiError(
+          403,
+          "Forbidden: You can only alter priority for issues within your assigned department."
+        );
+      }
+    }
+
+    const oldPriority = issue.priority;
+    issue.priority = priority;
+    await issue.save();
+
+    await ActivityLog.create({
+      user: req.user._id,
+      action: "ISSUE_PRIORITY_UPDATED",
+      entityType: "Issue",
+      entityId: issue._id,
+      details: {
+        oldPriority,
+        newPriority: priority,
+        note: note?.trim() || "",
+      },
+    });
+
+    return new ApiResponse(
+      200,
+      { issue },
+      `Issue priority updated from ${oldPriority} to ${priority}`
+    ).send(res);
+  })
+);
+
+/**
+ * PATCH /api/v1/issues/:id/reroute
+ * Re-route a miscategorized issue to a different municipal department
+ */
+router.patch(
+  "/:id/reroute",
+  protect,
+  authorize("manager", "admin"),
+  asyncHandler(async (req, res) => {
+    const { departmentId, category, note } = req.body;
+
+    if (!departmentId) {
+      throw new ApiError(400, "departmentId is required for department re-routing.");
+    }
+
+    const targetDept = await Department.findById(departmentId);
+    if (!targetDept) {
+      throw new ApiError(400, "Target department not found.");
+    }
+
+    const issue = await Issue.findById(req.params.id);
+    if (!issue) {
+      throw new ApiError(404, "Issue not found");
+    }
+
+    if (req.user.role === "manager") {
+      if (
+        req.user.department &&
+        issue.department &&
+        !issue.department.equals(req.user.department)
+      ) {
+        throw new ApiError(
+          403,
+          "Forbidden: You can only re-route issues originating from your assigned department."
+        );
+      }
+    }
+
+    const previousDeptId = issue.department;
+    issue.department = targetDept._id;
+
+    if (category && Issue.ISSUE_CATEGORIES.includes(category)) {
+      issue.category = category;
+    }
+
+    await issue.save();
+
+    const transferNote =
+      note?.trim() || `Issue re-routed to ${targetDept.name} (${targetDept.code})`;
+
+    // Record transition history noting department change
+    await IssueStatusHistory.create({
+      issue: issue._id,
+      fromStatus: issue.status,
+      toStatus: issue.status,
+      changedBy: req.user._id,
+      note: transferNote,
+    });
+
+    await ActivityLog.create({
+      user: req.user._id,
+      action: "ISSUE_REROUTED",
+      entityType: "Issue",
+      entityId: issue._id,
+      details: {
+        previousDepartment: previousDeptId,
+        newDepartment: targetDept._id,
+        departmentName: targetDept.name,
+        category: issue.category,
+        note: transferNote,
+      },
+    });
+
+    const populatedIssue = await Issue.findById(issue._id)
+      .populate("reporter", "name email image role")
+      .populate("department", "name code")
+      .populate("verifiedBy", "name email role")
+      .lean();
+
+    return new ApiResponse(
+      200,
+      { issue: populatedIssue },
+      `Issue successfully re-routed to ${targetDept.name}`
     ).send(res);
   })
 );
