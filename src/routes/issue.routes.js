@@ -2,6 +2,7 @@ const express = require("express");
 const { z } = require("zod");
 const Issue = require("../models/Issue");
 const Department = require("../models/Department");
+const Feedback = require("../models/Feedback");
 const IssueStatusHistory = require("../models/IssueStatusHistory");
 const ActivityLog = require("../models/ActivityLog");
 const { protect, optionalAuth } = require("../middleware/auth");
@@ -279,6 +280,7 @@ router.get(
         .populate("reporter", "name email image role")
         .populate("department", "name code")
         .populate("assignedTo", "name email")
+        .populate("feedback")
         .lean(),
       Issue.countDocuments(filter),
     ]);
@@ -409,6 +411,7 @@ router.get(
       .populate("department", "name code contactEmail contactPhone")
       .populate("assignedTo", "name email phone image")
       .populate("verifiedBy", "name email role")
+      .populate("feedback")
       .lean();
 
     if (!issue) {
@@ -913,6 +916,125 @@ router.patch(
       { issue: populatedIssue },
       "Duplicate flag removed successfully"
     ).send(res);
+  })
+);
+
+/**
+ * POST /api/v1/issues/:id/feedback
+ * Submit citizen satisfaction rating (1-5 stars) and comment on a resolved/closed issue
+ */
+router.post(
+  "/:id/feedback",
+  protect,
+  asyncHandler(async (req, res) => {
+    const { rating, comment } = req.body;
+
+    const numRating = parseInt(rating, 10);
+    if (isNaN(numRating) || numRating < 1 || numRating > 5) {
+      throw new ApiError(400, "Rating must be an integer between 1 and 5 stars.");
+    }
+
+    const issue = await Issue.findById(req.params.id);
+    if (!issue) {
+      throw new ApiError(404, "Issue not found.");
+    }
+
+    // 1. Ownership Guard: Original reporter only
+    if (!issue.reporter || !issue.reporter.equals(req.user._id)) {
+      throw new ApiError(
+        403,
+        "Forbidden: You can only submit feedback for public issues you personally reported."
+      );
+    }
+
+    // 2. Status Guard: Must be Resolved or Closed
+    if (issue.status !== "Resolved" && issue.status !== "Closed") {
+      throw new ApiError(
+        400,
+        `Citizen feedback can only be submitted once the issue has been marked Resolved. Current status: '${issue.status}'`
+      );
+    }
+
+    // 3. Single Review Constraint
+    const existingFeedback = await Feedback.findOne({ issue: issue._id });
+    if (existingFeedback) {
+      throw new ApiError(
+        409,
+        "Feedback has already been recorded for this issue. Duplicate submissions are not permitted."
+      );
+    }
+
+    // 4. Create Feedback document
+    const feedback = await Feedback.create({
+      issue: issue._id,
+      citizen: req.user._id,
+      department: issue.department || null,
+      rating: numRating,
+      comment: comment?.trim() || "",
+    });
+
+    // 5. Link feedback to issue
+    issue.feedback = feedback._id;
+    await issue.save();
+
+    // 6. Record ActivityLog
+    await ActivityLog.create({
+      user: req.user._id,
+      action: "FEEDBACK_SUBMITTED",
+      entityType: "Issue",
+      entityId: issue._id,
+      details: {
+        rating: numRating,
+        comment: feedback.comment,
+      },
+    });
+
+    // 7. Dispatch in-app notification to assigned technician if exists
+    if (issue.assignedTo) {
+      try {
+        const Notification = require("../models/Notification");
+        await Notification.create({
+          user: issue.assignedTo,
+          title: `Citizen Review Received: ${numRating} Stars`,
+          message: `The reporting citizen left a ${numRating}-star review for "${issue.title}": "${feedback.comment || "No comment"}"`,
+          type: "feedback_received",
+          issue: issue._id,
+        });
+      } catch (err) {
+        console.warn("Feedback notification notice:", err.message);
+      }
+    }
+
+    const populatedFeedback = await Feedback.findById(feedback._id)
+      .populate("citizen", "name email image")
+      .populate("department", "name code")
+      .lean();
+
+    return new ApiResponse(
+      201,
+      { feedback: populatedFeedback },
+      "Citizen feedback submitted successfully"
+    ).send(res);
+  })
+);
+
+/**
+ * GET /api/v1/issues/:id/feedback
+ * Retrieve citizen feedback for a specific issue
+ */
+router.get(
+  "/:id/feedback",
+  asyncHandler(async (req, res) => {
+    const feedback = await Feedback.findOne({ issue: req.params.id })
+      .populate("citizen", "name email image role")
+      .populate("department", "name code")
+      .lean();
+
+    if (!feedback) {
+      return new ApiResponse(200, { feedback: null }, "No feedback recorded for this issue").send(res);
+    }
+
+    return new ApiResponse(200, { feedback }, "Issue feedback retrieved successfully").send(res);
   })
 );
 

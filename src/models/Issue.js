@@ -137,6 +137,11 @@ const IssueSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    feedback: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Feedback",
+      default: null,
+    },
   },
   {
     timestamps: true,
