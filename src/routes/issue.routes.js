@@ -6,6 +6,7 @@ const IssueStatusHistory = require("../models/IssueStatusHistory");
 const ActivityLog = require("../models/ActivityLog");
 const { protect, optionalAuth } = require("../middleware/auth");
 const { authorize } = require("../middleware/roleCheck");
+const { transitionIssueStatus } = require("../services/issueWorkflow");
 const upload = require("../middleware/upload");
 const { uploadToCloudinary } = require("../config/cloudinary");
 const ApiResponse = require("../utils/apiResponse");
@@ -385,11 +386,6 @@ router.patch(
     const previousStatus = issue.status;
     issue.verifiedBy = req.user._id;
 
-    // Transition Submitted issues to Under Review
-    if (issue.status === "Submitted") {
-      issue.status = "Under Review";
-    }
-
     // Optional priority update during verification
     if (req.body.priority && Issue.ISSUE_PRIORITIES.includes(req.body.priority)) {
       issue.priority = req.body.priority;
@@ -399,33 +395,41 @@ router.patch(
 
     const note = req.body.note?.trim() || "Issue inspected and verified by municipal manager";
 
-    // Write to audit logs
-    await IssueStatusHistory.create({
-      issue: issue._id,
-      fromStatus: previousStatus,
-      toStatus: issue.status,
-      changedBy: req.user._id,
-      note,
-    });
-
-    await ActivityLog.create({
-      user: req.user._id,
-      action: "ISSUE_VERIFIED",
-      entityType: "Issue",
-      entityId: issue._id,
-      details: {
-        previousStatus,
-        newStatus: issue.status,
-        priority: issue.priority,
+    // Transition Submitted issues to Under Review using workflow engine
+    let populatedIssue;
+    if (issue.status === "Submitted") {
+      populatedIssue = await transitionIssueStatus(issue._id, "Under Review", req.user, {
         note,
-      },
-    });
+      });
+    } else {
+      // If already Under Review or beyond, write audit log
+      await IssueStatusHistory.create({
+        issue: issue._id,
+        fromStatus: previousStatus,
+        toStatus: issue.status,
+        changedBy: req.user._id,
+        note,
+      });
 
-    const populatedIssue = await Issue.findById(issue._id)
-      .populate("reporter", "name email image role")
-      .populate("department", "name code")
-      .populate("verifiedBy", "name email role")
-      .lean();
+      await ActivityLog.create({
+        user: req.user._id,
+        action: "ISSUE_VERIFIED",
+        entityType: "Issue",
+        entityId: issue._id,
+        details: {
+          previousStatus,
+          newStatus: issue.status,
+          priority: issue.priority,
+          note,
+        },
+      });
+
+      populatedIssue = await Issue.findById(issue._id)
+        .populate("reporter", "name email image role")
+        .populate("department", "name code")
+        .populate("verifiedBy", "name email role")
+        .lean();
+    }
 
     return new ApiResponse(
       200,
@@ -578,6 +582,36 @@ router.patch(
       200,
       { issue: populatedIssue },
       `Issue successfully re-routed to ${targetDept.name}`
+    ).send(res);
+  })
+);
+
+/**
+ * PATCH /api/v1/issues/:id/status
+ * Perform deterministic status transition using issueWorkflow state engine
+ */
+router.patch(
+  "/:id/status",
+  protect,
+  authorize("staff", "manager", "admin"),
+  asyncHandler(async (req, res) => {
+    const { status, note, metadata } = req.body;
+
+    if (!status) {
+      throw new ApiError(400, "status is required to transition issue.");
+    }
+
+    const updatedIssue = await transitionIssueStatus(
+      req.params.id,
+      status,
+      req.user,
+      { note, metadata }
+    );
+
+    return new ApiResponse(
+      200,
+      { issue: updatedIssue },
+      `Issue status successfully updated to '${status}'`
     ).send(res);
   })
 );
