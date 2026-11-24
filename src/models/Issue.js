@@ -114,10 +114,20 @@ const IssueSchema = new mongoose.Schema(
       ref: "User",
       default: null,
     },
+    isDuplicate: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
     isDuplicateOf: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Issue",
       default: null,
+      index: true,
+    },
+    duplicateCount: {
+      type: Number,
+      default: 0,
     },
     resolvedAt: {
       type: Date,

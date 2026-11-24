@@ -300,6 +300,104 @@ router.get(
 );
 
 /**
+ * GET /api/v1/issues/nearby
+ * Detect proximity duplicate issues within a spherical radius (default: 50m)
+ */
+router.get(
+  "/nearby",
+  asyncHandler(async (req, res) => {
+    const { lat, lng, radius = 50, category, excludeId } = req.query;
+
+    if (lat === undefined || lng === undefined) {
+      throw new ApiError(400, "Latitude (lat) and Longitude (lng) are required.");
+    }
+
+    const latitude = parseFloat(lat);
+    const longitude = parseFloat(lng);
+
+    if (
+      isNaN(latitude) ||
+      isNaN(longitude) ||
+      latitude < -90 ||
+      latitude > 90 ||
+      longitude < -180 ||
+      longitude > 180
+    ) {
+      throw new ApiError(400, "Invalid coordinates provided.");
+    }
+
+    const radiusMeters = Math.max(1, Math.min(2000, parseFloat(radius) || 50));
+    const earthRadiusMeters = 6378100;
+    const radians = radiusMeters / earthRadiusMeters;
+
+    const filter = {
+      location: {
+        $geoWithin: {
+          $centerSphere: [[longitude, latitude], radians],
+        },
+      },
+      isDuplicate: false,
+    };
+
+    if (category && category !== "all" && Issue.ISSUE_CATEGORIES.includes(category)) {
+      filter.category = category;
+    }
+
+    const mongoose = require("mongoose");
+    if (excludeId && mongoose.Types.ObjectId.isValid(excludeId)) {
+      filter._id = { $ne: excludeId };
+    }
+
+    const nearbyIssues = await Issue.find(filter)
+      .populate("reporter", "name email image role")
+      .populate("department", "name code")
+      .populate("assignedTo", "name email image")
+      .lean();
+
+    // Calculate exact distance in meters using Haversine formula
+    const haversineMeters = (lat1, lon1, lat2, lon2) => {
+      const R = 6378100;
+      const dLat = ((lat2 - lat1) * Math.PI) / 180;
+      const dLon = ((lon2 - lon1) * Math.PI) / 180;
+      const a =
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos((lat1 * Math.PI) / 180) *
+          Math.cos((lat2 * Math.PI) / 180) *
+          Math.sin(dLon / 2) *
+          Math.sin(dLon / 2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return Math.round(R * c);
+    };
+
+    const issuesWithDistance = nearbyIssues.map((item) => {
+      const itemLng = item.location?.coordinates?.[0];
+      const itemLat = item.location?.coordinates?.[1];
+      const distanceMeters =
+        itemLat !== undefined && itemLng !== undefined
+          ? haversineMeters(latitude, longitude, itemLat, itemLng)
+          : null;
+      return {
+        ...item,
+        distanceMeters,
+      };
+    });
+
+    // Sort closest first
+    issuesWithDistance.sort((a, b) => (a.distanceMeters ?? 0) - (b.distanceMeters ?? 0));
+
+    return new ApiResponse(
+      200,
+      {
+        issues: issuesWithDistance,
+        count: issuesWithDistance.length,
+        radiusMeters,
+      },
+      "Nearby issues retrieved successfully"
+    ).send(res);
+  })
+);
+
+/**
  * GET /api/v1/issues/:id
  * Retrieve issue details along with status transition history
  */
@@ -612,6 +710,208 @@ router.patch(
       200,
       { issue: updatedIssue },
       `Issue status successfully updated to '${status}'`
+    ).send(res);
+  })
+);
+
+/**
+ * PATCH /api/v1/issues/:id/mark-duplicate
+ * Flag an issue as duplicate of a parent issue, link them, transition child to Closed, and notify citizen
+ */
+router.patch(
+  "/:id/mark-duplicate",
+  protect,
+  authorize("manager", "admin"),
+  asyncHandler(async (req, res) => {
+    const { parentIssueId, note } = req.body;
+
+    if (!parentIssueId) {
+      throw new ApiError(400, "parentIssueId is required to mark issue as duplicate.");
+    }
+
+    if (req.params.id === parentIssueId) {
+      throw new ApiError(400, "An issue cannot be marked as a duplicate of itself.");
+    }
+
+    const [childIssue, parentIssue] = await Promise.all([
+      Issue.findById(req.params.id),
+      Issue.findById(parentIssueId),
+    ]);
+
+    if (!childIssue) {
+      throw new ApiError(404, "Child issue not found.");
+    }
+    if (!parentIssue) {
+      throw new ApiError(404, "Parent issue not found.");
+    }
+
+    if (parentIssue.isDuplicate) {
+      throw new ApiError(
+        400,
+        "Cannot link to a parent issue that is already flagged as a duplicate."
+      );
+    }
+
+    if (req.user.role === "manager") {
+      if (
+        req.user.department &&
+        childIssue.department &&
+        !childIssue.department.equals(req.user.department)
+      ) {
+        throw new ApiError(
+          403,
+          "Forbidden: You can only mark duplicates for issues within your assigned department."
+        );
+      }
+    }
+
+    const previousStatus = childIssue.status;
+    const previousDuplicateOf = childIssue.isDuplicateOf;
+
+    // Link duplicate and transition child to Closed
+    childIssue.isDuplicate = true;
+    childIssue.isDuplicateOf = parentIssue._id;
+    childIssue.status = "Closed";
+    childIssue.closedAt = new Date();
+    await childIssue.save();
+
+    // Increment parent issue duplicateCount if not already linked
+    if (!previousDuplicateOf || !previousDuplicateOf.equals(parentIssue._id)) {
+      await Issue.findByIdAndUpdate(parentIssue._id, { $inc: { duplicateCount: 1 } });
+    }
+
+    const duplicateNote =
+      note?.trim() ||
+      `Marked as duplicate of ticket "${parentIssue.title}" (#${parentIssue._id.toString().slice(-6)})`;
+
+    // Record transition history
+    await IssueStatusHistory.create({
+      issue: childIssue._id,
+      fromStatus: previousStatus,
+      toStatus: "Closed",
+      changedBy: req.user._id,
+      note: duplicateNote,
+    });
+
+    // Record ActivityLog
+    await ActivityLog.create({
+      user: req.user._id,
+      action: "ISSUE_MARKED_DUPLICATE",
+      entityType: "Issue",
+      entityId: childIssue._id,
+      details: {
+        childIssueId: childIssue._id,
+        parentIssueId: parentIssue._id,
+        parentTitle: parentIssue.title,
+        previousStatus,
+        note: duplicateNote,
+      },
+    });
+
+    // Dispatch notification to reporting citizen
+    if (childIssue.reporter && (!req.user._id || !childIssue.reporter.equals(req.user._id))) {
+      try {
+        const Notification = require("../models/Notification");
+        await Notification.create({
+          user: childIssue.reporter,
+          title: `Report Linked as Duplicate: "${childIssue.title}"`,
+          message: `Your public works report has been linked to existing active ticket "${parentIssue.title}". You will continue to receive municipal resolution updates.`,
+          type: "status_change",
+          issue: parentIssue._id,
+        });
+      } catch (err) {
+        console.warn("Notification dispatch notice:", err.message);
+      }
+    }
+
+    const populatedChild = await Issue.findById(childIssue._id)
+      .populate("reporter", "name email image role")
+      .populate("department", "name code")
+      .populate("isDuplicateOf", "title status category priority")
+      .lean();
+
+    return new ApiResponse(
+      200,
+      { issue: populatedChild, parentIssue: { _id: parentIssue._id, title: parentIssue.title } },
+      "Issue marked as duplicate successfully"
+    ).send(res);
+  })
+);
+
+/**
+ * PATCH /api/v1/issues/:id/unmark-duplicate
+ * Remove duplicate status and revert issue back to Under Review
+ */
+router.patch(
+  "/:id/unmark-duplicate",
+  protect,
+  authorize("manager", "admin"),
+  asyncHandler(async (req, res) => {
+    const issue = await Issue.findById(req.params.id);
+    if (!issue) {
+      throw new ApiError(404, "Issue not found.");
+    }
+
+    if (!issue.isDuplicate) {
+      throw new ApiError(400, "Issue is not currently marked as a duplicate.");
+    }
+
+    if (req.user.role === "manager") {
+      if (
+        req.user.department &&
+        issue.department &&
+        !issue.department.equals(req.user.department)
+      ) {
+        throw new ApiError(
+          403,
+          "Forbidden: You can only modify issues within your assigned department."
+        );
+      }
+    }
+
+    const parentId = issue.isDuplicateOf;
+    issue.isDuplicate = false;
+    issue.isDuplicateOf = null;
+    issue.status = "Under Review";
+    issue.closedAt = null;
+    await issue.save();
+
+    if (parentId) {
+      await Issue.findByIdAndUpdate(parentId, {
+        $inc: { duplicateCount: -1 },
+      });
+    }
+
+    const revertNote = req.body.note?.trim() || "Duplicate flag removed, reverted to Under Review";
+
+    await IssueStatusHistory.create({
+      issue: issue._id,
+      fromStatus: "Closed",
+      toStatus: "Under Review",
+      changedBy: req.user._id,
+      note: revertNote,
+    });
+
+    await ActivityLog.create({
+      user: req.user._id,
+      action: "ISSUE_UNMARKED_DUPLICATE",
+      entityType: "Issue",
+      entityId: issue._id,
+      details: {
+        previousParentId: parentId,
+        note: revertNote,
+      },
+    });
+
+    const populatedIssue = await Issue.findById(issue._id)
+      .populate("reporter", "name email image role")
+      .populate("department", "name code")
+      .lean();
+
+    return new ApiResponse(
+      200,
+      { issue: populatedIssue },
+      "Duplicate flag removed successfully"
     ).send(res);
   })
 );
