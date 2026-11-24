@@ -302,6 +302,52 @@ router.get(
 );
 
 /**
+ * GET /api/v1/issues/map/pins
+ * Lightweight geospatial coordinates projection for interactive city mapping
+ */
+router.get(
+  "/map/pins",
+  optionalAuth,
+  asyncHandler(async (req, res) => {
+    const { category, status, department, priority } = req.query;
+
+    const filter = {
+      isDuplicate: false,
+    };
+
+    if (category && category !== "All Categories" && category !== "all") {
+      filter.category = category;
+    }
+    if (status && status !== "all") {
+      filter.status = status;
+    }
+    if (priority && priority !== "all") {
+      filter.priority = priority;
+    }
+    if (department && department !== "all") {
+      filter.department = department;
+    }
+
+    if (req.user && req.user.role === "manager" && req.user.department) {
+      filter.department = req.user.department;
+    }
+
+    const pins = await Issue.find(filter)
+      .select("_id title category status priority location address image createdAt department")
+      .populate("department", "name code")
+      .sort({ createdAt: -1 })
+      .limit(500)
+      .lean();
+
+    return new ApiResponse(
+      200,
+      { pins, total: pins.length },
+      "Map coordinates retrieved successfully"
+    ).send(res);
+  })
+);
+
+/**
  * GET /api/v1/issues/nearby
  * Detect proximity duplicate issues within a spherical radius (default: 50m)
  */
