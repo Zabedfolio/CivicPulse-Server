@@ -17,15 +17,25 @@ const ApiError = require("./utils/apiError");
 
 const app = express();
 
+// Trust reverse proxy headers (Render, Railway, Vercel)
+app.set("trust proxy", 1);
+
 // Security HTTP headers
 app.use(helmet());
 
-// CORS configuration
-const allowedOrigins = [
-  process.env.CLIENT_URL || "http://localhost:3000",
-  "http://localhost:3000",
-  "http://127.0.0.1:3000",
-];
+// CORS configuration (supports comma-separated CLIENT_URL list)
+const envOrigins = (process.env.CLIENT_URL || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const allowedOrigins = Array.from(
+  new Set([
+    ...envOrigins,
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+  ])
+);
 
 app.use(
   cors({
