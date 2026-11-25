@@ -12,6 +12,7 @@ const departmentRouter = require("./routes/department.routes");
 const notificationRouter = require("./routes/notification.routes");
 const taskRouter = require("./routes/task.routes");
 const analyticsRouter = require("./routes/analytics.routes");
+const activityRouter = require("./routes/activity.routes");
 const ApiError = require("./utils/apiError");
 
 const app = express();
@@ -58,6 +59,7 @@ app.use("/api/v1/departments", departmentRouter);
 app.use("/api/v1/notifications", notificationRouter);
 app.use("/api/v1/tasks", taskRouter);
 app.use("/api/v1/analytics", analyticsRouter);
+app.use("/api/v1/activity", activityRouter);
 
 // Root route
 app.get("/", (req, res) => {
