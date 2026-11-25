@@ -478,4 +478,154 @@ router.get(
   })
 );
 
+/**
+ * GET /api/v1/users
+ * Admin route: Paginated directory of all municipal users across all 4 roles
+ */
+router.get(
+  "/",
+  protect,
+  authorize("admin"),
+  asyncHandler(async (req, res) => {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(50, Math.max(5, parseInt(req.query.limit, 10) || 15));
+    const skip = (page - 1) * limit;
+
+    const { role, status, search } = req.query;
+    const filter = {};
+
+    if (role && role !== "all") {
+      filter.role = role;
+    }
+
+    if (status === "active") {
+      filter.isActive = true;
+    } else if (status === "inactive") {
+      filter.isActive = false;
+    }
+
+    if (search && search.trim()) {
+      const q = search.trim();
+      filter.$or = [
+        { name: { $regex: q, $options: "i" } },
+        { email: { $regex: q, $options: "i" } },
+      ];
+    }
+
+    const [users, total, roleBreakdown] = await Promise.all([
+      User.find(filter)
+        .populate("department", "name code")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      User.countDocuments(filter),
+      User.aggregate([{ $group: { _id: "$role", count: { $sum: 1 } } }]),
+    ]);
+
+    const counts = { total: 0, admin: 0, manager: 0, staff: 0, citizen: 0 };
+    for (const r of roleBreakdown) {
+      if (r._id && counts[r._id] !== undefined) {
+        counts[r._id] = r.count;
+      }
+      counts.total += r.count;
+    }
+
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+
+    return new ApiResponse(
+      200,
+      {
+        users,
+        counts,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages,
+        },
+      },
+      "User directory retrieved successfully"
+    ).send(res);
+  })
+);
+
+/**
+ * PATCH /api/v1/users/:id
+ * Admin route: Update any user's role, department assignment, or active status
+ */
+router.patch(
+  "/:id",
+  protect,
+  authorize("admin"),
+  asyncHandler(async (req, res) => {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      throw new ApiError(400, "Invalid user ID format");
+    }
+
+    const targetUser = await User.findById(req.params.id);
+    if (!targetUser) {
+      throw new ApiError(404, "User account not found");
+    }
+
+    const { role, department, isActive } = req.body;
+    const isSelf = targetUser._id.toString() === req.user._id.toString();
+
+    if (isSelf && isActive === false) {
+      throw new ApiError(400, "Administrators cannot deactivate their own account.");
+    }
+
+    if (isSelf && role && role !== "admin") {
+      throw new ApiError(400, "Administrators cannot remove their own admin role.");
+    }
+
+    if (role !== undefined) {
+      if (!["admin", "manager", "staff", "citizen"].includes(role)) {
+        throw new ApiError(400, "Invalid role specified.");
+      }
+      targetUser.role = role;
+    }
+
+    if (department !== undefined) {
+      if (department === null || department === "") {
+        targetUser.department = null;
+      } else {
+        if (!mongoose.Types.ObjectId.isValid(department)) {
+          throw new ApiError(400, "Invalid department ID format");
+        }
+        const dept = await Department.findById(department);
+        if (!dept) {
+          throw new ApiError(404, "Specified department does not exist");
+        }
+        targetUser.department = dept._id;
+      }
+    }
+
+    if (isActive !== undefined) {
+      targetUser.isActive = Boolean(isActive);
+    }
+
+    await targetUser.save();
+
+    await ActivityLog.create({
+      user: req.user._id,
+      action: "USER_UPDATED",
+      entityType: "User",
+      entityId: targetUser._id,
+      details: {
+        name: targetUser.name,
+        email: targetUser.email,
+        role: targetUser.role,
+        isActive: targetUser.isActive,
+      },
+    });
+
+    const updated = await User.findById(targetUser._id)
+      .populate("department", "name code")
+      .lean();
+
+    return new ApiResponse(200, { user: updated }, "User account updated successfully").send(res);
+  })
+);
+
 module.exports = router;
