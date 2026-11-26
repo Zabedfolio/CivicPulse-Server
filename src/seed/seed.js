@@ -349,7 +349,7 @@ async function seed() {
   console.log("🔐 Provisioning Better Auth credential accounts (Password123!)...");
   const allUsers = [adminUser, ...createdManagers, ...allStaff, ...allCitizens];
   const accountsToInsert = allUsers.map((u) => ({
-    userId: u._id.toString(),
+    userId: u._id,
     accountId: u._id.toString(),
     providerId: "credential",
     password: passwordHash,

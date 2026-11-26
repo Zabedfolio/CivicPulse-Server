@@ -28,9 +28,17 @@ const protect = asyncHandler(async (req, res, next) => {
     throw new ApiError(500, "Database connection is not ready.");
   }
 
+  // Better Auth signs cookies as `<rawToken>.<signature>`; DB stores `<rawToken>`
+  let rawToken = token;
+  try {
+    rawToken = decodeURIComponent(token).split(".")[0];
+  } catch {
+    rawToken = token.split(".")[0];
+  }
+
   // Lookup active session in Better Auth session collection
   const session = await db.collection("session").findOne({
-    token: token,
+    token: { $in: [token, rawToken] },
     expiresAt: { $gt: new Date() },
   });
 
@@ -85,8 +93,15 @@ const optionalAuth = asyncHandler(async (req, res, next) => {
     const db = mongoose.connection.db;
     if (!db) return next();
 
+    let rawToken = token;
+    try {
+      rawToken = decodeURIComponent(token).split(".")[0];
+    } catch {
+      rawToken = token.split(".")[0];
+    }
+
     const session = await db.collection("session").findOne({
-      token: token,
+      token: { $in: [token, rawToken] },
       expiresAt: { $gt: new Date() },
     });
 
